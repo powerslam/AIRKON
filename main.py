@@ -27,6 +27,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import uvicorn
+import rclpy
+from detection_info_node import start_detection_info_buffer
+
 
 @dataclass
 class CameraAssets:
@@ -399,7 +402,7 @@ class InferWorker(threading.Thread):
                  score_mode="obj*cls", conf={1:0.3}, nms_iou=0.2, topk=50,
                  bev_scale=1.0, providers=None,
                  gui_queue=None, udp_sender=None, web_publisher=None,
-                 save_image_root=None):
+                 save_image_root=None, ros_bridge=None, ros_cam_offset: int = 0):
         super().__init__(daemon=True)
         self.streamer = streamer
         self.camera_assets = camera_assets
@@ -423,6 +426,9 @@ class InferWorker(threading.Thread):
                 tag_root = root / f"_{tag}"
                 tag_root.mkdir(parents=True, exist_ok=True)
                 self.save_dirs[tag] = tag_root
+        # ROS bridge (optional): provides already decoded detections per camera
+        self.ros_bridge = ros_bridge
+        self.ros_cam_offset = int(ros_cam_offset)
 
         if providers is None:
             providers = ["CUDAExecutionProvider","CPUExecutionProvider"] \
@@ -568,22 +574,41 @@ class InferWorker(threading.Thread):
                 wrk.bump()
                 continue
 
-            # 2) 배치 주입
-            with wrk.span("enqueue"):
-                for cid, chw in imgs_chw.items():
-                    self.runner.enqueue_frame(cid, chw)
+            per_cam_dets: Dict[int, List[Dict]] = {}
+            per_cam_outs = None
+            if self.ros_bridge is not None:
+                with wrk.span("grab_ros"):
+                    # 이미 디코드된 결과를 ROS 브릿지로부터 가져옴 (ROS 인덱스 -> 실제 cam_id 매핑 적용)
+                    raw_ros_dets = self.ros_bridge.get_latest()
+                    if self.ros_cam_offset != 0:
+                        mapped = {}
+                        for idx, det_list in raw_ros_dets.items():
+                            new_id = idx + self.ros_cam_offset
+                            if new_id in self.cam_ids:  # 존재하는 카메라만 반영
+                                mapped[new_id] = det_list
+                        per_cam_dets = mapped
 
-            # 3) 배치 실행
-            with wrk.span("infer"):
-                per_cam_outs = self.runner.run_if_ready()
-            if per_cam_outs is None:
-                time.sleep(0.001)
-                wrk.bump()
-                continue
+                        # print("@@@@@@@@@@@@@@@@@@@@@@")
+                        # print(per_cam_dets.items())
+                        # print("@@@@@@@@@@@@@@@@@@@@@@")
+                    else:
+                        # ROS 인덱스가 실제 cam_id 와 동일하다고 가정
+                        per_cam_dets = raw_ros_dets
+            else:
+                # 기존 ONNX 추론 경로
+                with wrk.span("enqueue"):
+                    for cid, chw in imgs_chw.items():
+                        self.runner.enqueue_frame(cid, chw)
+                with wrk.span("infer"):
+                    per_cam_outs = self.runner.run_if_ready()
+                if per_cam_outs is None:
+                    time.sleep(0.001)
+                    wrk.bump()
+                    continue
 
             # 4) 디코드/BEV/UDP/GUI 큐
             ts = time.time()
-            for cid, outs in per_cam_outs.items():
+            for cid in self.cam_ids:
                 meta = frame_meta.get(cid)
                 if meta is None:
                     continue
@@ -591,9 +616,15 @@ class InferWorker(threading.Thread):
                 frame_bgr = meta.get("bgr")
                 orig_hw = meta.get("orig_hw", (self.H, self.W))
                 orig_h, orig_w = int(orig_hw[0]), int(orig_hw[1])
-                self._save_image(frame_bgr, self.save_dirs.get("undist"), cid, capture_ts, "undist")
-                with wrk.span("decode"):
-                    dets = self._decode(cid,outs)
+
+                # print(orig_h, orig_w, self.H, self.W)
+                # self._save_image(frame_bgr, self.save_dirs.get("undist"), cid, capture_ts, "undist")
+                if self.ros_bridge is not None:
+                    dets = per_cam_dets.get(cid, [])
+                else:
+                    outs = per_cam_outs.get(cid, []) if per_cam_outs is not None else []
+                    with wrk.span("decode"):
+                        dets = self._decode(cid, outs) if outs else []
 
                 tris_img_orig = None
                 colors_hex = None
@@ -1129,6 +1160,11 @@ def main():
     ap.add_argument("--web-jpeg-quality", type=int, default=85)
     ap.add_argument("--global-ply", type=str, default="pointcloud/merged_05.ply")
     ap.add_argument("--vehicle-glb", type=str, default="pointcloud/car.glb")
+    # ROS bridge mode (use external decoded detections instead of ONNX inference)
+    ap.add_argument("--ros-detections", action="store_true", help="Use detections supplied via ROS topic 'detection_info' and skip ONNX inference")
+    ap.add_argument("--ros-topic", type=str, default="detection_info", help="Topic name for external decoded detections")
+    ap.add_argument("--ros-cam-offset", type=int, default=0,
+                    help="Integer offset added to positional camera indices from ROS detections (e.g. 1 if ROS sends 0..N-1 but local IDs start at 1)")
     args = ap.parse_args()
 
     # GUI 
@@ -1229,6 +1265,17 @@ def main():
 
     streamer.start()
     gui_queue = queue.Queue(maxsize=128)
+    ros_bridge = None
+    ros_spin_flag = None
+    if args.ros_detections:
+        try:
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            ros_bridge, ros_thread, ros_spin_flag = start_detection_info_buffer(topic_name=args.ros_topic)
+            print(f"[ROS] detection buffer started (topic={args.ros_topic})")
+        except Exception as e:
+            print(f"[ROS] buffer failed: {e}")
+            ros_bridge = None
     worker = InferWorker(
         streamer=streamer,
         camera_assets=camera_assets,
@@ -1245,6 +1292,8 @@ def main():
         udp_sender=udp_sender,
         web_publisher=web_bridge,
         save_image_root=args.save_image_root,
+        ros_bridge=ros_bridge,
+        ros_cam_offset=args.ros_cam_offset,
     )
     worker.start()
     if USE_GUI:
@@ -1306,6 +1355,17 @@ def main():
         if udp_sender: udp_sender.close()
         if web_bridge:
             web_bridge.stop()
+        if ros_bridge and ros_spin_flag:
+            try:
+                ros_spin_flag["run"] = False
+                ros_bridge.destroy_node()
+            except Exception:
+                pass
+            try:
+                if rclpy.ok():
+                    rclpy.shutdown()
+            except Exception:
+                pass
         if USE_GUI:
             try: cv2.destroyAllWindows()
             except: pass
